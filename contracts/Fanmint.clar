@@ -7,6 +7,10 @@
 (define-constant err-unauthorized (err u105))
 (define-constant err-perk-not-available (err u106))
 (define-constant err-insufficient-tokens (err u107))
+(define-constant err-milestone-not-found (err u108))
+(define-constant err-milestone-already-claimed (err u109))
+(define-constant err-milestone-not-reached (err u110))
+(define-constant err-invalid-milestone (err u111))
 
 (define-fungible-token fan-token)
 
@@ -40,6 +44,26 @@
 
 (define-data-var next-perk-id uint u1)
 (define-data-var platform-fee-rate uint u250)
+(define-data-var next-milestone-id uint u1)
+
+(define-map milestones uint {
+    creator: principal,
+    milestone-type: (string-ascii 20),
+    target-value: uint,
+    reward-tokens: uint,
+    deadline-block: uint,
+    claimed: bool,
+    achieved: bool,
+    achieved-block: uint
+})
+
+(define-map creator-milestone-stats principal {
+    total-supporters: uint,
+    total-stx-received: uint,
+    active-perks: uint,
+    total-milestones: uint,
+    claimed-milestones: uint
+})
 
 (define-public (register-creator (name (string-ascii 50)) (description (string-ascii 200)))
     (let ((creator tx-sender))
@@ -49,6 +73,13 @@
             description: description,
             total-tokens-issued: u0,
             active: true
+        })
+        (map-set creator-milestone-stats creator {
+            total-supporters: u0,
+            total-stx-received: u0,
+            active-perks: u0,
+            total-milestones: u0,
+            claimed-milestones: u0
         })
         (ok true)
     )
@@ -82,6 +113,15 @@
                 }
             )
         )
+        (let ((stats (default-to {total-supporters: u0, total-stx-received: u0, active-perks: u0, total-milestones: u0, claimed-milestones: u0} (map-get? creator-milestone-stats creator))))
+            (map-set creator-milestone-stats creator (merge stats {
+                total-supporters: (if (is-none (map-get? creator-supporters {creator: creator, supporter: supporter})) 
+                    (+ (get total-supporters stats) u1) 
+                    (get total-supporters stats)),
+                total-stx-received: (+ (get total-stx-received stats) amount)
+            }))
+        )
+        (try! (update-milestone-progress creator))
         (ok true)
     )
 )
@@ -109,6 +149,11 @@
             active: true
         })
         (var-set next-perk-id (+ perk-id u1))
+        (let ((stats (default-to {total-supporters: u0, total-stx-received: u0, active-perks: u0, total-milestones: u0, claimed-milestones: u0} (map-get? creator-milestone-stats creator))))
+            (map-set creator-milestone-stats creator (merge stats {
+                active-perks: (+ (get active-perks stats) u1)
+            }))
+        )
         (ok perk-id)
     )
 )
@@ -210,4 +255,142 @@
 
 (define-read-only (has-claimed-perk (user principal) (perk-id uint))
     (is-some (map-get? user-perks {user: user, perk-id: perk-id}))
+)
+
+(define-public (create-milestone 
+    (milestone-type (string-ascii 20))
+    (target-value uint)
+    (reward-tokens uint)
+    (deadline-blocks uint)
+)
+    (let (
+        (creator tx-sender)
+        (milestone-id (var-get next-milestone-id))
+        (deadline-block (+ stacks-block-height deadline-blocks))
+    )
+        (asserts! (is-some (map-get? creators creator)) err-not-found)
+        (asserts! (> target-value u0) err-invalid-milestone)
+        (asserts! (> reward-tokens u0) err-invalid-milestone)
+        (asserts! (> deadline-blocks u0) err-invalid-milestone)
+        (asserts! (or (is-eq milestone-type "supporters") 
+                      (is-eq milestone-type "stx-received") 
+                      (is-eq milestone-type "perks-created")) err-invalid-milestone)
+        (map-set milestones milestone-id {
+            creator: creator,
+            milestone-type: milestone-type,
+            target-value: target-value,
+            reward-tokens: reward-tokens,
+            deadline-block: deadline-block,
+            claimed: false,
+            achieved: false,
+            achieved-block: u0
+        })
+        (var-set next-milestone-id (+ milestone-id u1))
+        (let ((stats (default-to {total-supporters: u0, total-stx-received: u0, active-perks: u0, total-milestones: u0, claimed-milestones: u0} (map-get? creator-milestone-stats creator))))
+            (map-set creator-milestone-stats creator (merge stats {
+                total-milestones: (+ (get total-milestones stats) u1)
+            }))
+        )
+        (ok milestone-id)
+    )
+)
+
+(define-public (claim-milestone-reward (milestone-id uint))
+    (let (
+        (milestone-data (unwrap! (map-get? milestones milestone-id) err-milestone-not-found))
+        (creator (get creator milestone-data))
+    )
+        (asserts! (is-eq tx-sender creator) err-unauthorized)
+        (asserts! (get achieved milestone-data) err-milestone-not-reached)
+        (asserts! (not (get claimed milestone-data)) err-milestone-already-claimed)
+        (asserts! (<= stacks-block-height (get deadline-block milestone-data)) err-milestone-not-reached)
+        (try! (ft-mint? fan-token (get reward-tokens milestone-data) creator))
+        (map-set milestones milestone-id (merge milestone-data {
+            claimed: true
+        }))
+        (let ((stats (default-to {total-supporters: u0, total-stx-received: u0, active-perks: u0, total-milestones: u0, claimed-milestones: u0} (map-get? creator-milestone-stats creator))))
+            (map-set creator-milestone-stats creator (merge stats {
+                claimed-milestones: (+ (get claimed-milestones stats) u1)
+            }))
+        )
+        (ok true)
+    )
+)
+
+(define-private (update-milestone-progress (creator principal))
+    (let ((stats (default-to {total-supporters: u0, total-stx-received: u0, active-perks: u0, total-milestones: u0, claimed-milestones: u0} (map-get? creator-milestone-stats creator))))
+        (try! (check-and-update-milestone creator "supporters" (get total-supporters stats)))
+        (try! (check-and-update-milestone creator "stx-received" (get total-stx-received stats)))
+        (try! (check-and-update-milestone creator "perks-created" (get active-perks stats)))
+        (ok true)
+    )
+)
+
+(define-private (check-and-update-milestone (creator principal) (milestone-type (string-ascii 20)) (current-value uint))
+    (let ((milestone-search-result (get-creator-milestone-by-type creator milestone-type)))
+        (match (get result milestone-search-result)
+            some-id (let ((milestone-data (unwrap! (map-get? milestones some-id) err-milestone-not-found)))
+                (if (and (not (get achieved milestone-data)) 
+                         (>= current-value (get target-value milestone-data))
+                         (<= stacks-block-height (get deadline-block milestone-data)))
+                    (begin
+                        (map-set milestones some-id (merge milestone-data {
+                            achieved: true,
+                            achieved-block: stacks-block-height
+                        }))
+                        (ok true)
+                    )
+                    (ok false)
+                )
+            )
+            (ok false)
+        )
+    )
+)
+
+(define-private (get-creator-milestone-by-type (creator principal) (milestone-type (string-ascii 20)))
+    (fold find-milestone-by-type-and-creator (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20) {creator: creator, milestone-type: milestone-type, result: none})
+)
+
+(define-private (find-milestone-by-type-and-creator (milestone-id uint) (search-params {creator: principal, milestone-type: (string-ascii 20), result: (optional uint)}))
+    (match (get result search-params)
+        some-result search-params
+        (match (map-get? milestones milestone-id)
+            some-milestone (if (and (is-eq (get creator some-milestone) (get creator search-params))
+                                   (is-eq (get milestone-type some-milestone) (get milestone-type search-params))
+                                   (not (get achieved some-milestone)))
+                              (merge search-params {result: (some milestone-id)})
+                              search-params)
+            search-params
+        )
+    )
+)
+
+(define-read-only (get-milestone-info (milestone-id uint))
+    (map-get? milestones milestone-id)
+)
+
+(define-read-only (get-creator-milestone-stats (creator principal))
+    (map-get? creator-milestone-stats creator)
+)
+
+(define-read-only (get-creator-active-milestones (creator principal))
+    (let ((milestones-list (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20)))
+        (filter is-creator-milestone (map get-milestone-with-id milestones-list))
+    )
+)
+
+(define-private (get-milestone-with-id (milestone-id uint))
+    {milestone-id: milestone-id, milestone-data: (map-get? milestones milestone-id)}
+)
+
+(define-private (is-creator-milestone (milestone-info {milestone-id: uint, milestone-data: (optional {creator: principal, milestone-type: (string-ascii 20), target-value: uint, reward-tokens: uint, deadline-block: uint, claimed: bool, achieved: bool, achieved-block: uint})}))
+    (match (get milestone-data milestone-info)
+        some-data (and (is-eq (get creator some-data) tx-sender) (not (get claimed some-data)))
+        false
+    )
+)
+
+(define-read-only (get-next-milestone-id)
+    (var-get next-milestone-id)
 )
