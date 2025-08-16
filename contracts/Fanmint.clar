@@ -11,6 +11,11 @@
 (define-constant err-milestone-already-claimed (err u109))
 (define-constant err-milestone-not-reached (err u110))
 (define-constant err-invalid-milestone (err u111))
+(define-constant err-subscription-not-found (err u112))
+(define-constant err-tier-not-found (err u113))
+(define-constant err-already-subscribed (err u114))
+(define-constant err-subscription-expired (err u115))
+(define-constant err-invalid-tier (err u116))
 
 (define-fungible-token fan-token)
 
@@ -45,6 +50,32 @@
 (define-data-var next-perk-id uint u1)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var next-milestone-id uint u1)
+(define-data-var next-subscription-tier-id uint u1)
+
+(define-map subscription-tiers uint {
+    creator: principal,
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    monthly-cost: uint,
+    fan-token-bonus: uint,
+    max-subscribers: uint,
+    current-subscribers: uint,
+    active: bool
+})
+
+(define-map subscriber-tiers {subscriber: principal, tier-id: uint} {
+    subscribed-at: uint,
+    last-payment: uint,
+    next-payment-due: uint,
+    total-payments: uint,
+    active: bool
+})
+
+(define-map creator-subscriptions principal {
+    total-subscription-revenue: uint,
+    active-subscriptions: uint,
+    total-tiers: uint
+})
 
 (define-map milestones uint {
     creator: principal,
@@ -80,6 +111,11 @@
             active-perks: u0,
             total-milestones: u0,
             claimed-milestones: u0
+        })
+        (map-set creator-subscriptions creator {
+            total-subscription-revenue: u0,
+            active-subscriptions: u0,
+            total-tiers: u0
         })
         (ok true)
     )
@@ -394,3 +430,206 @@
 (define-read-only (get-next-milestone-id)
     (var-get next-milestone-id)
 )
+
+(define-public (create-subscription-tier
+    (name (string-ascii 50))
+    (description (string-ascii 200))
+    (monthly-cost uint)
+    (fan-token-bonus uint)
+    (max-subscribers uint)
+)
+    (let (
+        (creator tx-sender)
+        (tier-id (var-get next-subscription-tier-id))
+    )
+        (asserts! (is-some (map-get? creators creator)) err-not-found)
+        (asserts! (> monthly-cost u0) err-invalid-tier)
+        (asserts! (> max-subscribers u0) err-invalid-tier)
+        (map-set subscription-tiers tier-id {
+            creator: creator,
+            name: name,
+            description: description,
+            monthly-cost: monthly-cost,
+            fan-token-bonus: fan-token-bonus,
+            max-subscribers: max-subscribers,
+            current-subscribers: u0,
+            active: true
+        })
+        (var-set next-subscription-tier-id (+ tier-id u1))
+        (let ((sub-stats (default-to {total-subscription-revenue: u0, active-subscriptions: u0, total-tiers: u0} (map-get? creator-subscriptions creator))))
+            (map-set creator-subscriptions creator (merge sub-stats {
+                total-tiers: (+ (get total-tiers sub-stats) u1)
+            }))
+        )
+        (ok tier-id)
+    )
+)
+
+(define-public (subscribe-to-tier (tier-id uint))
+    (let (
+        (subscriber tx-sender)
+        (tier-data (unwrap! (map-get? subscription-tiers tier-id) err-tier-not-found))
+        (creator (get creator tier-data))
+        (monthly-cost (get monthly-cost tier-data))
+        (platform-fee (/ (* monthly-cost (var-get platform-fee-rate)) u10000))
+        (creator-amount (- monthly-cost platform-fee))
+        (current-block stacks-block-height)
+        (next-payment (+ current-block u4320))
+    )
+        (asserts! (get active tier-data) err-tier-not-found)
+        (asserts! (< (get current-subscribers tier-data) (get max-subscribers tier-data)) err-invalid-tier)
+        (asserts! (is-none (map-get? subscriber-tiers {subscriber: subscriber, tier-id: tier-id})) err-already-subscribed)
+        (try! (stx-transfer? monthly-cost subscriber (as-contract tx-sender)))
+        (try! (ft-mint? fan-token creator-amount creator))
+        (try! (ft-mint? fan-token (+ creator-amount (get fan-token-bonus tier-data)) subscriber))
+        (map-set subscription-tiers tier-id (merge tier-data {
+            current-subscribers: (+ (get current-subscribers tier-data) u1)
+        }))
+        (map-set subscriber-tiers {subscriber: subscriber, tier-id: tier-id} {
+            subscribed-at: current-block,
+            last-payment: current-block,
+            next-payment-due: next-payment,
+            total-payments: u1,
+            active: true
+        })
+        (let ((sub-stats (default-to {total-subscription-revenue: u0, active-subscriptions: u0, total-tiers: u0} (map-get? creator-subscriptions creator))))
+            (map-set creator-subscriptions creator (merge sub-stats {
+                total-subscription-revenue: (+ (get total-subscription-revenue sub-stats) creator-amount),
+                active-subscriptions: (+ (get active-subscriptions sub-stats) u1)
+            }))
+        )
+        (ok true)
+    )
+)
+
+(define-public (process-subscription-payment (tier-id uint) (subscriber principal))
+    (let (
+        (tier-data (unwrap! (map-get? subscription-tiers tier-id) err-tier-not-found))
+        (subscription-data (unwrap! (map-get? subscriber-tiers {subscriber: subscriber, tier-id: tier-id}) err-subscription-not-found))
+        (creator (get creator tier-data))
+        (monthly-cost (get monthly-cost tier-data))
+        (platform-fee (/ (* monthly-cost (var-get platform-fee-rate)) u10000))
+        (creator-amount (- monthly-cost platform-fee))
+        (current-block stacks-block-height)
+        (next-payment (+ current-block u4320))
+    )
+        (asserts! (get active subscription-data) err-subscription-expired)
+        (asserts! (>= current-block (get next-payment-due subscription-data)) err-subscription-not-found)
+        (try! (stx-transfer? monthly-cost subscriber (as-contract tx-sender)))
+        (try! (ft-mint? fan-token creator-amount creator))
+        (try! (ft-mint? fan-token (+ creator-amount (get fan-token-bonus tier-data)) subscriber))
+        (map-set subscriber-tiers {subscriber: subscriber, tier-id: tier-id} (merge subscription-data {
+            last-payment: current-block,
+            next-payment-due: next-payment,
+            total-payments: (+ (get total-payments subscription-data) u1)
+        }))
+        (let ((sub-stats (default-to {total-subscription-revenue: u0, active-subscriptions: u0, total-tiers: u0} (map-get? creator-subscriptions creator))))
+            (map-set creator-subscriptions creator (merge sub-stats {
+                total-subscription-revenue: (+ (get total-subscription-revenue sub-stats) creator-amount)
+            }))
+        )
+        (ok true)
+    )
+)
+
+(define-public (cancel-subscription (tier-id uint))
+    (let (
+        (subscriber tx-sender)
+        (tier-data (unwrap! (map-get? subscription-tiers tier-id) err-tier-not-found))
+        (subscription-data (unwrap! (map-get? subscriber-tiers {subscriber: subscriber, tier-id: tier-id}) err-subscription-not-found))
+        (creator (get creator tier-data))
+    )
+        (asserts! (get active subscription-data) err-subscription-expired)
+        (map-set subscription-tiers tier-id (merge tier-data {
+            current-subscribers: (- (get current-subscribers tier-data) u1)
+        }))
+        (map-set subscriber-tiers {subscriber: subscriber, tier-id: tier-id} (merge subscription-data {
+            active: false
+        }))
+        (let ((sub-stats (default-to {total-subscription-revenue: u0, active-subscriptions: u0, total-tiers: u0} (map-get? creator-subscriptions creator))))
+            (map-set creator-subscriptions creator (merge sub-stats {
+                active-subscriptions: (- (get active-subscriptions sub-stats) u1)
+            }))
+        )
+        (ok true)
+    )
+)
+
+(define-public (toggle-subscription-tier-status (tier-id uint))
+    (let (
+        (creator tx-sender)
+        (tier-data (unwrap! (map-get? subscription-tiers tier-id) err-tier-not-found))
+    )
+        (asserts! (is-eq creator (get creator tier-data)) err-unauthorized)
+        (map-set subscription-tiers tier-id (merge tier-data {
+            active: (not (get active tier-data))
+        }))
+        (ok true)
+    )
+)
+
+(define-public (update-subscription-tier 
+    (tier-id uint)
+    (new-monthly-cost uint)
+    (new-fan-token-bonus uint)
+    (new-max-subscribers uint)
+)
+    (let (
+        (creator tx-sender)
+        (tier-data (unwrap! (map-get? subscription-tiers tier-id) err-tier-not-found))
+    )
+        (asserts! (is-eq creator (get creator tier-data)) err-unauthorized)
+        (asserts! (> new-monthly-cost u0) err-invalid-tier)
+        (asserts! (>= new-max-subscribers (get current-subscribers tier-data)) err-invalid-tier)
+        (map-set subscription-tiers tier-id (merge tier-data {
+            monthly-cost: new-monthly-cost,
+            fan-token-bonus: new-fan-token-bonus,
+            max-subscribers: new-max-subscribers
+        }))
+        (ok true)
+    )
+)
+
+(define-read-only (get-subscription-tier-info (tier-id uint))
+    (map-get? subscription-tiers tier-id)
+)
+
+(define-read-only (get-subscriber-info (subscriber principal) (tier-id uint))
+    (map-get? subscriber-tiers {subscriber: subscriber, tier-id: tier-id})
+)
+
+(define-read-only (get-creator-subscription-stats (creator principal))
+    (map-get? creator-subscriptions creator)
+)
+
+(define-read-only (get-next-subscription-tier-id)
+    (var-get next-subscription-tier-id)
+)
+
+(define-read-only (is-subscription-due (subscriber principal) (tier-id uint))
+    (match (map-get? subscriber-tiers {subscriber: subscriber, tier-id: tier-id})
+        some-subscription (and (get active some-subscription) 
+                              (>= stacks-block-height (get next-payment-due some-subscription)))
+        false
+    )
+)
+
+(define-read-only (get-creator-subscription-tiers (creator principal))
+    (let ((tiers-list (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20)))
+        (filter is-creator-tier (map get-tier-with-id tiers-list))
+    )
+)
+
+(define-private (get-tier-with-id (tier-id uint))
+    {tier-id: tier-id, tier-data: (map-get? subscription-tiers tier-id)}
+)
+
+(define-private (is-creator-tier (tier-info {tier-id: uint, tier-data: (optional {creator: principal, name: (string-ascii 50), description: (string-ascii 200), monthly-cost: uint, fan-token-bonus: uint, max-subscribers: uint, current-subscribers: uint, active: bool})}))
+    (match (get tier-data tier-info)
+        some-data (is-eq (get creator some-data) tx-sender)
+        false
+    )
+)
+
+
+
